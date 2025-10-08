@@ -2,26 +2,74 @@ import re
 from pathlib import Path
 import shutil
 
-# --- 来自 remove_moves.py ---
-PATTERN = r"\n.*(?:move|,(?:0|[1-9]\d?|[1-4]\d{2}|5[0-3]\d|540)(?:\.\d+)?\)).*"
+def get_playresy(text: str) -> int | None:
+    """从 [Script Info] 段中提取 PlayResY 数字；若失败返回 None"""
+    m = re.search(r"(?mi)^\s*PlayResY\s*:\s*(\d+)\s*$", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
 
-def process_file(path: Path, dest_dir: Path) -> tuple[Path, bool]:
+def process_file(path: Path, dest_dir: Path) -> tuple[Path, bool, bool]:
     """
-    将正则替换后的内容写入 dest_dir，返回写入的目标文件路径和是否发生修改的布尔值。
-    仅在未发生修改时输出提示（"未更改"），修改时不输出单条提示。
+    删除规则：
+      1. 含 '\move' 的行整行删除；
+      2. 含 '\pos(x,y)' 且 y < PlayResY / 2 的行整行删除；
+    若 PlayResY 缺失或非法，跳过文件。
     """
-    # 使用 errors="replace" 以在遇到不可解码字节时用替代字符替换，避免异常终止
     text = path.read_text(encoding="utf-8-sig", errors="replace")
-    new_text = re.sub(PATTERN, "", text)
+
+    # --- 读取 PlayResY ---
+    m = re.search(r"(?mi)^\s*PlayResY\s*:\s*(\d+)\s*$", text)
+    if not m:
+        print(f"未更改: {path.name}（获取视频高度失败）")
+        return path, False, False
+    try:
+        playresy = int(m.group(1))
+    except ValueError:
+        print(f"未更改: {path.name}（获取视频高度失败）")
+        return path, False, False
+
+    threshold = playresy / 2.0
+
+    # --- 匹配规则 ---
+    move_re = re.compile(r"\\move", re.IGNORECASE)
+    pos_re = re.compile(r"\\pos\s*\(([\d.]+)\s*,\s*([\d.]+)\)", re.IGNORECASE)
+
+
+    new_lines = []
+    for line in text.splitlines(keepends=True):
+        # 含 move → 删除
+        if move_re.search(line):
+            continue
+
+        # 含 pos() → 判断第二个数字(y)是否小于阈值
+        m = pos_re.search(line)
+        if m:
+            try:
+                y = float(m.group(2))
+                if y < threshold:
+                    continue
+            except ValueError:
+                pass
+
+        # 保留行
+        new_lines.append(line)
+
+    new_text = "".join(new_lines)
     dest_dir.mkdir(exist_ok=True)
     out_path = dest_dir / path.name
     out_path.write_text(new_text, encoding="utf-8", errors="replace")
+
     modified = (new_text != text)
     if not modified:
         print(f"未更改: {path.name}")
-    return out_path, modified
+    return out_path, modified, True
 
-# --- 来自 ass_to_lrc.py ---
+# ----------------（ass to lrc）----------------
+
 TIME_RE = re.compile(r"(\d+):(\d{2}):(\d{2})\.(\d{1,2})")
 
 def parse_ass_time(t: str):
@@ -42,10 +90,8 @@ def parse_ass_time(t: str):
     return f"{minutes:02d}:{seconds:02d}.{hundredths:02d}", total
 
 def format_time_from_total(total: float) -> str:
-    # 将秒数（float）格式化为 mm:ss.hh（百位为 hundredths）
     minutes = int(total // 60)
     seconds = int(total % 60)
-    # 分离秒的小数部分以计算百位
     frac = total - (minutes * 60 + seconds)
     hundredths = int(round(frac * 100))
     if hundredths >= 100:
@@ -57,7 +103,6 @@ def format_time_from_total(total: float) -> str:
     return f"{minutes:02d}:{seconds:02d}.{hundredths:02d}"
 
 def clean_ass_text(s: str) -> str:
-    # 移除 ASS 覆盖标签，合并换行为一个空格
     s = re.sub(r"\{.*?\}", "", s)
     s = s.replace(r"\N", " ").replace(r"\n", " ")
     return s.strip()
@@ -75,7 +120,7 @@ def convert_file(path: Path, out_dir: Path) -> tuple[bool, str | None]:
     for line in lines:
         if not line.startswith("Dialogue:"):
             continue
-        parts = line.split(",", 9)  # 文本在第9个逗号之后
+        parts = line.split(",", 9)
         if len(parts) < 10:
             continue
         start = parts[1].strip()
@@ -92,61 +137,51 @@ def convert_file(path: Path, out_dir: Path) -> tuple[bool, str | None]:
         return False, "no_entries"
 
     entries.sort(key=lambda x: x[0])
-
     out_path = out_dir / (path.stem + ".lrc")
     if out_path.exists():
         print(f"{path.name}未转换（lrc已存在）")
         return False, "exists"
-
+    
     # 将重复时间戳的连续组进行重分配
     new_entries = []
     i = 0
     n = len(entries)
     while i < n:
-        # 查找从 i 开始的相同时间戳组（基于 total 值相等）
         j = i + 1
         while j < n and abs(entries[j][0] - entries[i][0]) < 1e-9:
             j += 1
         group_len = j - i
         if group_len == 1:
-            # 单项，直接保留原时间戳
             total, ts, lyric = entries[i]
             new_entries.append((total, ts, lyric))
             i = j
             continue
-
-        # group_len >= 2，需要重分配时间戳
         cur_total = entries[i][0]
-        # 找下一不同时间点的 total
         if j < n:
             next_total = entries[j][0]
             span = next_total - cur_total
-            # 若下一个时间点与当前相等或跨度极小，则退化为小步长分配
             if span <= 1e-6:
-                step = 0.05  # fallback step 0.05s
+                step = 0.05
                 for k in range(group_len):
                     t = cur_total + step * k
                     ts_str = format_time_from_total(t)
                     new_entries.append((t, ts_str, entries[i + k][2]))
             else:
-                # 在 cur_total 和 next_total 之间均匀生成 group_len 个时间点
                 step = span / group_len
                 for k in range(group_len):
                     t = cur_total + step * k
                     ts_str = format_time_from_total(t)
                     new_entries.append((t, ts_str, entries[i + k][2]))
         else:
-            # 没有下一个时间点，向后使用固定小步长分配
             step = 0.05
             for k in range(group_len):
                 t = cur_total + step * k
                 ts_str = format_time_from_total(t)
                 new_entries.append((t, ts_str, entries[i + k][2]))
         i = j
-
+    
     # 确保按时间排序（重分配后顺序可能保持，但再次排序以保证）
     new_entries.sort(key=lambda x: x[0])
-
     out_lines = [f"[{ts}]{ly}" for _, ts, ly in new_entries]
     out_path.write_text("\n".join(out_lines), encoding="utf-8", errors="replace")
     return True, None
@@ -168,7 +203,10 @@ def main():
 
     # 处理：将替换后的 .ass 写入 替换后ass，并用这些文件生成 .lrc（输出到原目录）
     for f in ass_files:
-        replaced_file, modified = process_file(f, replaced_dir)  # 写入替换后ass，返回新路径和是否修改
+        replaced_file, modified, ok_to_continue = process_file(f, replaced_dir)
+        # PlayResY 不合法则直接跳过所有后续
+        if not ok_to_continue:
+            continue
         if modified:
             modified_count += 1
         converted, reason = convert_file(replaced_file, p)
@@ -180,6 +218,7 @@ def main():
                 print(f"{f.name}未转换")
 
     print(f"共{total}个ass文件，本次共成功修改{modified_count}个，成功转换{converted_count}个。")
+
 
 if __name__ == "__main__":
     main()
